@@ -2209,16 +2209,16 @@ class Comms(ChainManager):
         current_window: int,
         init_version: str | None = None,
         is_master: bool = True,
-    ) -> tuple[bool, int]:
+    ) -> tuple[bool, int, int]:
         """
         Rank-0 downloads; all ranks fan-out once.
-        Returns (success, checkpoint_sync_window) identically on all ranks.
+        Returns (success, checkpoint_sync_window, global_step) identically on all ranks.
         """
         # --------- rank-0 fetch + minimal metadata ----------
-        ok, sync_win, full_sd, present = False, 0, {}, set()
+        ok, sync_win, global_step_val, full_sd, present = False, 0, 0, {}, set()
         if is_master:
             try:
-                init_version = init_version or __version__
+                init_version = init_version or tplr.__version__
             except NameError:
                 pass
             result = await self.get_latest_checkpoint(init_version)
@@ -2234,6 +2234,7 @@ class Comms(ChainManager):
                     sync_win = int(
                         sw if sw is not None else cw if cw is not None else 0
                     )
+                    global_step_val = checkpoint_data.get("global_step", 0)
                     ok = True
 
                     tplr.logger.info(
@@ -2244,18 +2245,28 @@ class Comms(ChainManager):
                     )
                 except Exception as e:
                     tplr.logger.error(f"[ckpt] parse/load failed on rank-0: {e}")
-                    ok, sync_win, full_sd, present = False, 0, {}, set()
+                    ok, sync_win, global_step_val, full_sd, present = (
+                        False,
+                        0,
+                        0,
+                        {},
+                        set(),
+                    )
             else:
                 tplr.logger.info("No valid checkpoints found on rank-0")
 
         # --------- broadcast tiny meta-object to all ranks ----------
         if dist.is_available() and dist.is_initialized():
-            obj = [(bool(ok), int(sync_win), list(present))] if is_master else [None]
+            obj = (
+                [(bool(ok), int(sync_win), int(global_step_val), list(present))]
+                if is_master
+                else [None]
+            )
             dist.broadcast_object_list(obj, src=0)
-            ok, sync_win, present_list = obj[0]
+            ok, sync_win, global_step_val, present_list = obj[0]
             present = set(present_list or [])
         if not ok:
-            return False, 0
+            return False, 0, 0
 
         # --------- single fan-out of weights/buffers ----------
         set_model_state_dict(
@@ -2275,7 +2286,7 @@ class Comms(ChainManager):
             else:
                 dist.barrier()
 
-        return True, int(sync_win)
+        return True, int(sync_win), int(global_step_val)
 
     async def post_peer_list(
         self,

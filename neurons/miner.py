@@ -415,7 +415,7 @@ class Miner(BaseNode, Trainer):
         #   • remaining ranks receive state via NCCL broadcast
         # ------------------------------------------------------------------
 
-        ckpt_ok, ckpt_sync_win = await self.comms.load_checkpoint(
+        ckpt_ok, ckpt_sync_win, ckpt_global_step = await self.comms.load_checkpoint(
             model=self.bare_model,
             current_window=self.current_window,
             init_version=tplr.__version__

@@ -2023,6 +2023,7 @@ class Validator(BaseNode, Trainer):
                     "start_window": self.start_window,
                     "current_window": self.current_window,
                     "sync_window": self.sync_window,
+                    "global_step": self.global_step,  # Save actual outer steps taken
                 }
 
                 if self.is_master:
@@ -3029,7 +3030,7 @@ class Validator(BaseNode, Trainer):
         # Proceed to load checkpoint
         #   • rank-0 (or single-GPU run) downloads & catches-up
         #   • remaining ranks receive state via NCCL broadcast
-        ckpt_ok, ckpt_sync_win = await self.comms.load_checkpoint(
+        ckpt_ok, ckpt_sync_win, ckpt_global_step = await self.comms.load_checkpoint(
             model=self.model,
             current_window=self.current_window,
             init_version=tplr.__version__
