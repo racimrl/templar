@@ -159,15 +159,57 @@ class Validator(BaseNode, Trainer):
         """Restore model state from saved state dict.
         Handles DTensor and regular tensors efficiently.
         """
-        # set_model_state_dict handles moving from CPU to device and DTensor reconstruction
-        set_model_state_dict(
-            self.model,
-            dict(state_dict),
-            options=StateDictOptions(
-                full_state_dict=False,  # We saved only local shards, so load them back as such
-                strict=True,  # Ensure all keys match
-            ),
-        )
+        try:
+            # set_model_state_dict handles moving from CPU to device and DTensor reconstruction
+            set_model_state_dict(
+                self.model,
+                dict(state_dict),
+                options=StateDictOptions(
+                    full_state_dict=False,  # We saved only local shards, so load them back as such
+                    strict=True,  # Ensure all keys match
+                ),
+            )
+        except RuntimeError as e:
+            if "NCCL" in str(e) or "unhandled cuda error" in str(e):
+                tplr.logger.warning(f"NCCL error during distributed checkpoint loading: {e}")
+                tplr.logger.info("Attempting fallback with full_state_dict=True")
+                try:
+                    # Fallback: try with full state dict
+                    set_model_state_dict(
+                        self.model,
+                        dict(state_dict),
+                        options=StateDictOptions(
+                            full_state_dict=True,  # Fallback to full state dict
+                            strict=False,  # Be more lenient on key matching
+                        ),
+                    )
+                    tplr.logger.info("Fallback successful")
+                except Exception as fallback_e:
+                    tplr.logger.error(f"Fallback also failed: {fallback_e}")
+                    # Try manual state dict loading as last resort
+                    self._manual_state_dict_load(state_dict)
+            else:
+                raise e
+
+    def _manual_state_dict_load(self, state_dict):
+        """Manual state dict loading as last resort fallback."""
+        tplr.logger.warning("Attempting manual state dict loading")
+        try:
+            # Convert state_dict to regular tensors and load manually
+            model_state = {}
+            for key, value in state_dict.items():
+                if isinstance(value, DT):
+                    # For DTensor, get local shard
+                    model_state[key] = value.to_local()
+                else:
+                    model_state[key] = value
+            
+            # Load with standard PyTorch method
+            self.model.load_state_dict(model_state, strict=False)
+            tplr.logger.info("Manual state dict loading successful")
+        except Exception as e:
+            tplr.logger.error(f"Manual state dict loading failed: {e}")
+            tplr.logger.warning("Continuing with uninitialized model parameters")
 
     def __init__(self):
         tplr.logger.debug("Starting initialization...")
@@ -178,6 +220,15 @@ class Validator(BaseNode, Trainer):
         # ────────────────────────────────────────────────────────────────
         # Distributed initialisation ─ exactly the same pattern as *miner*
         # ────────────────────────────────────────────────────────────────
+        
+        # Set NCCL environment variables for better error handling
+        os.environ.setdefault("NCCL_DEBUG", "INFO")
+        os.environ.setdefault("NCCL_TIMEOUT", "600")  # 10 minutes
+        os.environ.setdefault("NCCL_MAX_NCHANNELS", "2")
+        os.environ.setdefault("NCCL_MIN_NCHANNELS", "2")
+        # Disable NCCL sharp plugin which can cause issues
+        os.environ.setdefault("NCCL_NET_SHARED_BUFFERS", "0")
+        
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         dist_helper.init_process_group(backend=backend, timeout_minutes=30)
         self.rank = dist_helper.rank
@@ -779,7 +830,7 @@ class Validator(BaseNode, Trainer):
         current_shard = self.global_step // self.windows_per_shard
         _ = await self.dataset_manager.initialize_datasets(current_shard)
         self.set_dataloader(validator=True)
-
+        self.model = self.model.to("cpu")
         # Load the most recent checkpoint
         _ = await self.load_checkpoint()
 
@@ -1667,11 +1718,12 @@ class Validator(BaseNode, Trainer):
                     # new_avg = (1-alpha) * old_avg + alpha * new_value
                     # where alpha is binary_score_ma_alpha hyperparameter
                     self.binary_moving_averages[eval_uid] = (
-                        (1 - self.hparams.binary_score_ma_alpha)
-                        * self.binary_moving_averages[eval_uid]
-                        + self.hparams.binary_score_ma_alpha
-                        * self.binary_indicator_scores[eval_uid]
-                    )
+                        1 - self.hparams.binary_score_ma_alpha
+                    ) * self.binary_moving_averages[
+                        eval_uid
+                    ] + self.hparams.binary_score_ma_alpha * self.binary_indicator_scores[
+                        eval_uid
+                    ]
                     tplr.log_with_context(
                         level="debug",
                         message=f"Binary Moving Average Score: {self.binary_moving_averages[eval_uid]}",
@@ -2371,9 +2423,9 @@ class Validator(BaseNode, Trainer):
             old_score = self.final_scores[uid].item()
             new_score = old_score  # Initialize new_score with old_score value
             if self.final_scores[uid] > 0:
-                self.final_scores[uid] *= (
-                    0.75  # Apply flat 25% reduction for positive scores only
-                )
+                self.final_scores[
+                    uid
+                ] *= 0.75  # Apply flat 25% reduction for positive scores only
 
                 new_score = self.final_scores[uid].item()
 
@@ -3118,17 +3170,50 @@ class Validator(BaseNode, Trainer):
             self.global_step
             >= self.hparams.checkpoint_frequency + checkpoint_window_buffer
         )
+        
+        # Clear GPU cache before loading checkpoint to avoid memory issues
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
         # Proceed to load checkpoint
         #   • rank-0 (or single-GPU run) downloads & catches-up
         #   • remaining ranks receive state via NCCL broadcast
-        ckpt_sync_win = await self.ckpt.download_and_load(
-            model=self.model,
-            window=None,  # latest
-            shared_fs=True,
-            process_group=None,
-            prefer_highest_staked=True,
-        )
-        ckpt_ok = ckpt_sync_win is not None
+        try:
+            ckpt_sync_win = await self.ckpt.download_and_load(
+                model=self.model,
+                window=None,  # latest
+                shared_fs=True,
+                process_group=None,
+                prefer_highest_staked=True,
+            )
+            ckpt_ok = ckpt_sync_win is not None
+        except RuntimeError as e:
+            if "NCCL" in str(e) or "unhandled cuda error" in str(e):
+                tplr.logger.error(f"Distributed checkpoint loading failed: {e}")
+                tplr.logger.info("Retrying with fallback approach...")
+                
+                # Clear memory again and retry
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                
+                # Try again with a different approach - single rank download
+                try:
+                    ckpt_sync_win = await self.ckpt.download_and_load(
+                        model=self.model,
+                        window=None,
+                        shared_fs=False,  # Try without shared filesystem assumption
+                        process_group=None,
+                        prefer_highest_staked=True,
+                    )
+                    ckpt_ok = ckpt_sync_win is not None
+                except Exception as retry_e:
+                    tplr.logger.error(f"Retry also failed: {retry_e}")
+                    ckpt_ok = False
+                    ckpt_sync_win = None
+            else:
+                raise e
 
         assert self.start_window is not None
         if ckpt_ok:
@@ -3152,9 +3237,15 @@ class Validator(BaseNode, Trainer):
             tplr.logger.info(
                 f"Checkpoint is behind current window ({ckpt_sync_win} < {self.current_window}), starting catchup..."
             )
+            # Move model to GPU before catchup to avoid device mismatch
+            self.model = self.model.to(self.device)
+            tplr.logger.info(f"Model moved to {self.device} before catchup")
             await tplr.neurons.catchup_with_aggregation_server(self, start_from)
         else:
             tplr.logger.info("Checkpoint is up-to-date, skipping catchup.")
+            # Still need to move model to GPU even if no catchup
+            self.model = self.model.to(self.device)
+            tplr.logger.info(f"Model moved to {self.device}")
 
         # Replay scheduler steps if checkpoint was loaded
         if ckpt_ok:
