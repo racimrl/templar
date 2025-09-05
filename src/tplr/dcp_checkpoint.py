@@ -423,6 +423,26 @@ class DCPCheckpointer:
                 pass
         return self.comms.bucket
 
+    async def _get_bucket_by_name(self, bucket_name: str):
+        """
+        Reconstruct bucket object from bucket name by searching through commitments.
+        """
+        try:
+            # Get commitments to find the bucket with matching name
+            commitments = await self.comms.get_commitments()
+            for bucket in commitments.values():
+                if hasattr(bucket, "name") and bucket.name == bucket_name:
+                    return bucket
+            tplr.logger.warning(
+                f"Could not find bucket with name {bucket_name} in commitments"
+            )
+            return None
+        except Exception as e:
+            tplr.logger.error(
+                f"Error reconstructing bucket from name {bucket_name}: {e}"
+            )
+            return None
+
     # ── Discover latest remote window ──────────────────────────────────────────
     async def _discover_latest(
         self, *, prefer_highest_staked: bool = True
@@ -538,21 +558,157 @@ class DCPCheckpointer:
         Result: repo_root/checkpoints/<version>/<window>/... is complete for all ranks.
         """
         t_all = time.perf_counter()
+        world, r = _world(), _rank()
+
+        # Only rank 0 discovers the latest window, then broadcasts to all ranks
         if window is None:
-            window = await self._discover_latest(
-                prefer_highest_staked=prefer_highest_staked
-            )
+            if r == 0:
+                window = await self._discover_latest(
+                    prefer_highest_staked=prefer_highest_staked
+                )
+                if window is None:
+                    tplr.logger.info("Rank 0 found no checkpoint windows")
+            else:
+                window = None
+
+            # Broadcast the window from rank 0 to all other ranks
+            if world > 1 and dist.is_initialized():
+                try:
+                    # Use CUDA device if available, fallback to CPU
+                    device = torch.device(
+                        "cuda" if torch.cuda.is_available() else "cpu"
+                    )
+
+                    # Create tensor for broadcasting
+                    if r == 0:
+                        window_tensor = torch.tensor(
+                            [window if window is not None else -1],
+                            dtype=torch.long,
+                            device=device,
+                        )
+                    else:
+                        window_tensor = torch.tensor(
+                            [-1], dtype=torch.long, device=device
+                        )
+
+                    # Broadcast from rank 0 to all other ranks
+                    dist.broadcast(window_tensor, src=0)
+
+                    # Extract the window value
+                    broadcasted_window = window_tensor.item()
+                    if broadcasted_window == -1:
+                        window = None
+                    else:
+                        window = broadcasted_window
+
+                    tplr.logger.info(f"Rank {r} received window {window} from rank 0")
+                except Exception as e:
+                    tplr.logger.error(f"Failed to broadcast window from rank 0: {e}")
+                    # Fallback: each rank discovers independently if broadcast fails
+                    if r != 0:
+                        tplr.logger.info(
+                            f"Rank {r} falling back to independent window discovery"
+                        )
+                        window = await self._discover_latest(
+                            prefer_highest_staked=prefer_highest_staked
+                        )
+
             if window is None:
                 return None
 
         layout = Layout(self.version, window)
         local_dir = self._local_dir(layout)
 
-        world, r = _world(), _rank()
-        # Try highest-staked bucket first, then own
-        bucket = await self._choose_read_bucket(
-            prefer_highest_staked=prefer_highest_staked
-        )
+        # Only rank 0 chooses the bucket, then broadcasts to all ranks
+        if r == 0:
+            bucket = await self._choose_read_bucket(
+                prefer_highest_staked=prefer_highest_staked
+            )
+            if bucket is None:
+                tplr.logger.error(
+                    "Rank 0: Cannot proceed - highest-staked validator bucket not available"
+                )
+                bucket_name = ""
+            else:
+                bucket_name = bucket.name
+        else:
+            bucket = None
+            bucket_name = ""
+
+        # Broadcast the bucket name from rank 0 to all other ranks
+        if world > 1 and dist.is_initialized():
+            try:
+                # Convert bucket name to tensor for broadcasting
+                if r == 0:
+                    # Use CUDA device if available, fallback to CPU
+                    device = torch.device(
+                        "cuda" if torch.cuda.is_available() else "cpu"
+                    )
+                    bucket_name_bytes = bucket_name.encode("utf-8")
+                    bucket_tensor = torch.tensor(
+                        [len(bucket_name_bytes)] + list(bucket_name_bytes),
+                        dtype=torch.uint8,
+                        device=device,
+                    )
+                    # Pad to fixed size (assuming bucket names won't exceed 1000 chars)
+                    if len(bucket_tensor) > 1001:
+                        bucket_tensor = bucket_tensor[:1001]
+                    else:
+                        bucket_tensor = torch.cat(
+                            [
+                                bucket_tensor,
+                                torch.zeros(
+                                    1001 - len(bucket_tensor),
+                                    dtype=torch.uint8,
+                                    device=device,
+                                ),
+                            ]
+                        )
+                else:
+                    device = torch.device(
+                        "cuda" if torch.cuda.is_available() else "cpu"
+                    )
+                    bucket_tensor = torch.zeros(1001, dtype=torch.uint8, device=device)
+
+                dist.broadcast(bucket_tensor, src=0)
+
+                # Decode bucket name on non-rank-0 processes
+                if r != 0:
+                    name_length = bucket_tensor[0].item()
+                    if name_length > 0:
+                        bucket_name_bytes = bytes(
+                            bucket_tensor[1 : name_length + 1].tolist()
+                        )
+                        bucket_name = bucket_name_bytes.decode("utf-8")
+                        # Reconstruct bucket from name (we'll need to get it from commitments)
+                        bucket = await self._get_bucket_by_name(bucket_name)
+                    else:
+                        bucket = None
+
+                tplr.logger.info(
+                    f"Rank {r} using highest-staked validator bucket {bucket_name}"
+                )
+            except Exception as e:
+                tplr.logger.error(f"Failed to broadcast bucket from rank 0: {e}")
+                # Fallback: each rank gets bucket independently if broadcast fails
+                if r != 0:
+                    tplr.logger.info(
+                        f"Rank {r} falling back to independent bucket selection"
+                    )
+                    bucket = await self._choose_read_bucket(
+                        prefer_highest_staked=prefer_highest_staked
+                    )
+        elif r != 0:
+            # For single-rank or uninitialized distributed, still enforce highest-staked only
+            bucket = await self._choose_read_bucket(
+                prefer_highest_staked=prefer_highest_staked
+            )
+
+        if bucket is None:
+            tplr.logger.error(
+                f"Rank {r} cannot proceed: highest-staked validator bucket not available"
+            )
+            return None
         s3 = await self.comms._get_s3_client(bucket)
         # 1) Enumerate keys under the window prefix
         keys: list[tuple[str, int]] = []
